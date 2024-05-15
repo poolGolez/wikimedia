@@ -15,9 +15,9 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.serialization.StringDeserializer;
-import org.opensearch.action.DocWriteResponse;
+import org.opensearch.action.bulk.BulkRequest;
+import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.index.IndexRequest;
-import org.opensearch.action.index.IndexResponse;
 import org.opensearch.client.RequestOptions;
 import org.opensearch.client.RestClient;
 import org.opensearch.client.RestHighLevelClient;
@@ -67,30 +67,21 @@ public class WikimediaConsumer {
                 kafkaConsumer.subscribe(Collections.singletonList(TOPIC_WIKIMEDIA));
 
                 while (true) {
-                    ConsumerRecords<String, String> records = kafkaConsumer.poll(Duration.ofMillis(00));
+                    ConsumerRecords<String, String> records = kafkaConsumer.poll(Duration.ofMillis(5000));
+
+                    BulkRequest bulkRequest = new BulkRequest();
+
                     for (ConsumerRecord<String, String> record : records) {
+                        IndexRequest indexRequest = createIndexRequest(record);
+                        bulkRequest.add(indexRequest);
+                    }
 
-                        JsonObject recordData = (JsonObject) JsonParser.parseString(record.value());
-                        JsonObject indexData = new JsonObject();
-                        for (String key : List.of("id", "title", "$schema", "type", "timestamp")) {
-                            JsonElement node = recordData.get(key);
-                            if (node != null) {
-                                indexData.addProperty(key, node.getAsString());
-                            }
-                        }
-
-
-                        String indexId = String.format("%s:%d:%d", record.topic(), record.partition(), record.offset());
-                        IndexRequest indexRequest = new IndexRequest(INDEX_WIKIMEDIA)
-                                .source(indexData, XContentType.JSON)
-                                .id(indexId);
-
-
-                        IndexResponse indexResponse = openSearchClient.index(indexRequest, RequestOptions.DEFAULT);
-                        if (indexResponse.getResult() != DocWriteResponse.Result.CREATED) {
-                            logger.error("Error writing document: {}", record.value());
+                    if (bulkRequest.numberOfActions() > 0) {
+                        BulkResponse bulkResponse = openSearchClient.bulk(bulkRequest, RequestOptions.DEFAULT);
+                        if (bulkResponse.hasFailures()) {
+                            logger.error("Error on batch request: {}", bulkResponse.buildFailureMessage());
                         } else {
-                            logger.info("Written reco");
+                            logger.info("Wrote {} records for {} seconds", bulkResponse.getItems().length, bulkResponse.getTook().seconds());
                         }
                     }
                 }
@@ -102,6 +93,23 @@ public class WikimediaConsumer {
         }
     }
 
+    private static IndexRequest createIndexRequest(ConsumerRecord<String, String> record) {
+        JsonObject recordData = (JsonObject) JsonParser.parseString(record.value());
+        String documentId = recordData.getAsJsonObject("meta").get("id").getAsString();
+        JsonObject indexData = new JsonObject();
+        for (String key : List.of("id", "title", "timestamp")) {
+            JsonElement node = recordData.get(key);
+            if (node != null) {
+                indexData.addProperty(key, node.getAsString());
+            }
+        }
+
+        IndexRequest indexRequest = new IndexRequest(INDEX_WIKIMEDIA)
+                .source(record.value(), XContentType.JSON)
+                .id(documentId);
+        return indexRequest;
+    }
+
     private static KafkaConsumer<String, String> createKafkaConsumer() {
         Properties props = new Properties();
 
@@ -110,14 +118,15 @@ public class WikimediaConsumer {
         props.setProperty(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
 
         props.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-        props.setProperty(ConsumerConfig.GROUP_ID_CONFIG, "opensearch-sink");
+        props.setProperty(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "true");
+        props.setProperty(ConsumerConfig.AUTO_COMMIT_INTERVAL_MS_CONFIG, "5000");
+        props.setProperty(ConsumerConfig.GROUP_ID_CONFIG, "opensearch-local-sink-autocommit");
 
         return new KafkaConsumer<>(props);
     }
 
     private static RestHighLevelClient createOpenSearchClient() {
-        String connString = "https://ceq0jowaxd:2weem0iwy7@wikimedia-9115593284.ap-southeast-2.bonsaisearch.net:443";
-        // we build a URI from the connection string
+        String connString = "http://localhost:9200";
         URI connUri = URI.create(connString);
 
         // extract login information if it exists
